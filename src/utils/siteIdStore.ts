@@ -61,9 +61,14 @@ if (DATABASE_URL) {
     query_timeout: 3000,
   });
   pool.on('error', (e: any) => logThrottled(`postgres pool error: ${e?.code || e?.message}`));
-  // Create the table if it is not there yet (idempotent; touches nothing else).
+  // Create the table only if it is missing (idempotent; touches nothing else). The existence
+  // check comes first because a role limited to this table has no CREATE on the schema, and
+  // even `CREATE TABLE IF NOT EXISTS` is refused for it when the table is already there.
   const ddl = fs.readFileSync(path.resolve(__dirname, '../../migrations/0001_anivault_siteids.sql'), 'utf8');
-  dbReady = pool.query(ddl).then(
+  dbReady = pool
+    .query("SELECT to_regclass('anivault_siteids') AS t")
+    .then((r) => (r.rows[0]?.t ? undefined : pool!.query(ddl).then(() => undefined)))
+    .then(
     () => undefined,
     (e: any) => {
       dbDownUntil = Date.now() + DB_BACKOFF_MS;
