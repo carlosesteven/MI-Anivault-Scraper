@@ -175,8 +175,17 @@ export async function findAnikotoSlug(title: string): Promise<string | null> {
 
   const unique = Array.from(new Map(allResults.map((result) => [result.slug, result])).values());
   if (!unique.length) return null;
-  return unique.map((result) => ({ result, score: scoreTitle(title, result.title) })).sort((a, b) => b.score - a.score)[0]
-    .result.slug;
+  const best = unique.map((result) => ({ result, score: scoreTitle(title, result.title) })).sort((a, b) => b.score - a.score)[0];
+
+  // Without a floor, the best of whatever the search returned was accepted no matter how
+  // unrelated (a score under 60 means the titles do not even contain each other). Same
+  // floor AnimeHeaven uses.
+  const MIN_ACCEPT_SCORE = 60;
+  if (best.score < MIN_ACCEPT_SCORE) {
+    console.error(`[Anikoto] best match rejected: ${best.result.title} score=${best.score}`);
+    return null;
+  }
+  return best.result.slug;
 }
 
 // ══════════════════════════════════════════════════════════════
