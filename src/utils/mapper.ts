@@ -1,15 +1,27 @@
 import axios from 'axios';
 import { anilistClient } from './fetch';
-import { cacheGet, cacheSet } from './cache';
+import { cacheGet, cacheSet, cacheDel } from './cache';
 import { findAnimeHeavenId } from '../scrapers/animeheaven';
 import { findAnikotoSlug } from '../scrapers/anikoto';
 import { findDesidubSlug } from '../scrapers/desidub';
 import { getAnimeDetails } from '../scrapers/mal';
+import { fetchAnilistMeta } from './anilistMeta';
+import { storeGet, storeSet, storeDelete } from './siteIdStore';
+
+// Forget everything cached for one anime (memory + Redis + SQLite) so the next request
+// re-resolves it from scratch. The escape hatch for a wrong/stale permanent mapping.
+export async function invalidateSiteIds(anilistId: number) {
+  cacheDel(`siteids:${anilistId}`);
+  return storeDelete(anilistId);
+}
 
 export interface SiteIds {
   anilistId: number | null;
   malId: number | null;
   title: string;
+  // Providers searched and not found -> unix ms of that search. Only used by the
+  // AniList-id path (getSiteIds) to avoid re-searching a known miss on every call.
+  missing?: Record<string, number>;
   // Secondary title candidate (opposite of `title`'s romaji/English choice)
   // used only to retry site-matching (Anikoto/AnimeHeaven/DesiDub) when the primary
   // title doesn't score a good match. Not part of the public /info response
@@ -95,6 +107,11 @@ export async function malToAnilist(malId: number): Promise<number | null> {
 
 // Fetch title from AniList for a given anilistId
 async function getAnilistTitle(anilistId: number): Promise<{ title: string; altTitle: string | null; malId: number | null }> {
+  // Optional self-hosted metadata service first (env-configured); any failure falls through
+  // to AniList's GraphQL API below, which is the unchanged original behavior.
+  const viaMeta = await fetchAnilistMeta(anilistId);
+  if (viaMeta) return viaMeta;
+
   const query = `query ($id: Int) {
     Media(id: $id, type: ANIME) { idMal title { romaji english } }
   }`;
@@ -109,22 +126,63 @@ async function getAnilistTitle(anilistId: number): Promise<{ title: string; altT
   };
 }
 
-// AniList ID → metadata + site-specific IDs
-export async function getSiteIds(anilistId: number): Promise<SiteIds | null> {
-  const cacheKey = `siteids:${anilistId}`;
-  const cached = cacheGet<SiteIds>(cacheKey);
-  if (cached) {
-    const wasMissingAnimeHeaven = !cached.siteIds.animeheaven;
-    const wasMissingAnikoto = !cached.siteIds.anikoto;
-    const wasMissingDesidub = !cached.siteIds.desidub;
-    const enriched = await enrichDesidub(await enrichAnikoto(await enrichAnimeHeaven(cached, cached.altTitle), cached.altTitle), cached.altTitle);
-    if ((wasMissingAnimeHeaven && enriched.siteIds.animeheaven) || (wasMissingAnikoto && enriched.siteIds.anikoto) || (wasMissingDesidub && enriched.siteIds.desidub)) {
-      cacheSet(cacheKey, enriched);
-    }
-    return enriched;
+// A provider that was searched and not found is not searched again for this long (seconds).
+// Without this, every request re-ran the full title search for every missing provider.
+const NEGATIVE_TTL_MS = parseInt(process.env.SITEIDS_NEGATIVE_TTL || '1800') * 1000;
+
+// Optional legacy mapping source (only yields zoro/gogoanime ids, which no route here uses).
+// Disabled unless a base URL is configured: "<base>/<anilistId>?fields=mappings".
+const ANIFY_MAPPINGS_URL = (process.env.ANIFY_MAPPINGS_URL || '').replace(/\/+$/, '');
+
+const PROVIDERS = ['animeheaven', 'anikoto', 'desidub'] as const;
+type Provider = typeof PROVIDERS[number];
+const ENRICHERS: Record<Provider, (r: SiteIds, alt?: string | null) => Promise<SiteIds>> = {
+  animeheaven: enrichAnimeHeaven,
+  anikoto: enrichAnikoto,
+  desidub: enrichDesidub,
+};
+
+// Re-search only the providers that are missing AND whose last miss is older than the
+// negative window. Sequential on purpose (the provider sites rate-limit bursts).
+async function refreshMissing(record: SiteIds): Promise<boolean> {
+  record.missing = record.missing ?? {};
+  let changed = false;
+  for (const p of PROVIDERS) {
+    if (record.siteIds[p]) continue;
+    const lastMiss = record.missing[p];
+    if (lastMiss !== undefined && Date.now() - lastMiss < NEGATIVE_TTL_MS) continue;
+    await ENRICHERS[p](record, record.altTitle);
+    if (record.siteIds[p]) delete record.missing[p];
+    else record.missing[p] = Date.now();
+    changed = true;
+  }
+  return changed;
+}
+
+// Never keep a record whose title could not be resolved - in memory or on disk - or a
+// transient AniList failure would freeze "Unknown" (and zero providers) for that anime.
+async function persist(record: SiteIds): Promise<void> {
+  if (record.anilistId == null || record.title === 'Unknown') return;
+  cacheSet(`siteids:${record.anilistId}`, record);
+  await storeSet(record as any);
+}
+
+async function resolveAnilistSiteIds(anilistId: number): Promise<SiteIds | null> {
+  const memKey = `siteids:${anilistId}`;
+  let record = cacheGet<SiteIds>(memKey);
+  let fromMemory = Boolean(record);
+  if (!record) {
+    const stored = await storeGet(anilistId);
+    if (stored) record = stored.record as SiteIds;
   }
 
-  // Build result shell using AniList (always reliable for title + malId)
+  if (record) {
+    if (await refreshMissing(record)) await persist(record);
+    else if (!fromMemory) cacheSet(memKey, record);
+    return record;
+  }
+
+  // Cold: nothing known about this anime yet.
   const alInfo = await getAnilistTitle(anilistId).catch(() => ({ title: 'Unknown', altTitle: null, malId: null }));
 
   const result: SiteIds = {
@@ -133,28 +191,27 @@ export async function getSiteIds(anilistId: number): Promise<SiteIds | null> {
     title: alInfo.title,
     altTitle: alInfo.altTitle,
     siteIds: {},
+    missing: {},
   };
 
-  // Try Anify for site mappings
-  try {
-    const res = await axios.get(`https://api.anify.tv/info/${anilistId}`, {
-      params: { fields: 'mappings' },
-      timeout: 8000,
-    });
-    const mappings: any[] = res.data?.mappings ?? [];
-    for (const m of mappings) {
-      if (m.providerId === 'zoro')      result.siteIds.zoro = m.id;
-      if (m.providerId === 'gogoanime') result.siteIds.gogoanime = m.id;
-      
-      if (m.providerId === 'mal' && !result.malId) result.malId = parseInt(m.id);
+  if (ANIFY_MAPPINGS_URL) {
+    try {
+      const res = await axios.get(`${ANIFY_MAPPINGS_URL}/${anilistId}`, {
+        params: { fields: 'mappings' },
+        timeout: 8000,
+      });
+      const mappings: any[] = res.data?.mappings ?? [];
+      for (const m of mappings) {
+        if (m.providerId === 'zoro')      result.siteIds.zoro = m.id;
+        if (m.providerId === 'gogoanime') result.siteIds.gogoanime = m.id;
+        if (m.providerId === 'mal' && !result.malId) result.malId = parseInt(m.id);
+      }
+    } catch {
+      // mapping source down or missing - fall through to the direct scrapers below
     }
-  } catch {
-    // Anify down or missing — fall through to direct scraper fallbacks below
   }
 
-  await enrichAnimeHeaven(result, result.altTitle);
-  await enrichAnikoto(result, result.altTitle);
-  await enrichDesidub(result, result.altTitle);
+  await refreshMissing(result);
 
   // If still no zoro ID, try a slug guess (title-anilistId format common on HiAnime clones)
   // This is a heuristic and may not always work
@@ -163,8 +220,22 @@ export async function getSiteIds(anilistId: number): Promise<SiteIds | null> {
     result.siteIds.zoro = `${slug}-${anilistId}`;
   }
 
-  cacheSet(cacheKey, result);
+  await persist(result);
   return result;
+}
+
+// Concurrent requests for the same anime share ONE resolution instead of each running its
+// own full search (a burst of users opening the same new anime would otherwise multiply
+// the load on the provider sites).
+const inflight = new Map<number, Promise<SiteIds | null>>();
+
+// AniList ID → metadata + site-specific IDs
+export function getSiteIds(anilistId: number): Promise<SiteIds | null> {
+  const running = inflight.get(anilistId);
+  if (running) return running;
+  const p = resolveAnilistSiteIds(anilistId).finally(() => inflight.delete(anilistId));
+  inflight.set(anilistId, p);
+  return p;
 }
 
 // AniList-free fallback: build SiteIds from a MAL ID alone (title comes from

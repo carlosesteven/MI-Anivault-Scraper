@@ -211,13 +211,34 @@ One call instead of chaining several.
 | `GET /api/anime?malId=` | MAL details + poster/cover/logo, merged |
 | `GET /api/episode?malId=&ep=` | MAL episode metadata + thumbnail. Omit `ep` for the whole show's episode list (bounded concurrency via `concurrency=`, default 5, max 10) |
 
+## Site-id cache (optional, env-driven)
+
+The slowest part of a cold request is resolving an AniList id into the slugs each
+provider uses (animeheaven / anikoto / desidub). That mapping almost never changes, so
+it can be kept permanently in two optional levels. Nothing is enabled unless its
+variable is set (see `env.example`):
+
+| Variable | Effect |
+|---|---|
+| `SITEIDS_REDIS_URL` | L1: shared Redis. Instances pointing at the same Redis share resolutions. `SITEIDS_REDIS_TTL` (seconds, default 7 days) |
+| `SITEIDS_DB_PATH` | L2: permanent SQLite file. Survives restarts and Redis flushes |
+| `SITEIDS_NEGATIVE_TTL` | Seconds before a provider that was searched and not found is searched again (default 1800) |
+| `ANILIST_META_BASE_URL` | Resolve title/malId through your own metadata service (`<base>/<anilistId>` → `{ id, title: { romaji, english }, malId }`) instead of calling AniList directly; falls back to AniList on any failure. `ANILIST_META_TIMEOUT_MS` (default 5000) |
+| `ANIFY_MAPPINGS_URL` | Legacy zoro/gogoanime mapping source. Off when empty (no route uses those ids) |
+| `ADMIN_TOKEN` | Enables `DELETE /api/cache/siteids/:anilistId` (send it as `x-admin-token`). Disabled while empty |
+
+Lookup order: memory → Redis → SQLite → full resolution. A record whose title could not
+be resolved is never stored, so a transient AniList outage cannot pin a wrong result.
+Concurrent requests for the same anime share a single resolution. Because entries are
+permanent, a wrong match stays until you drop it with the `DELETE` endpoint above.
+
 ## Tech stack
 
 | | |
 |---|---|
 | Runtime | Node.js (Express), TypeScript |
 | Scraping | Cheerio, Axios |
-| Caching | node-cache (in-memory), optional Upstash Redis |
+| Caching | node-cache (in-memory), optional shared Redis + SQLite (see above) |
 | Hosting | Railway |
 
 ## Status

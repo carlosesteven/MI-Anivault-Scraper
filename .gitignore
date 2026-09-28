@@ -1,0 +1,21 @@
+# Secrets / local config — NEVER commit. Use env.example as the template.
+.env
+.env.*
+!env.example
+
+# Dependencies and build output
+node_modules/
+dist/
+dist-test/
+
+# Local persistent data (site-id cache DB, etc.)
+data/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Logs / OS noise
+*.log
+.DS_Store

@@ -1,7 +1,8 @@
 import { Router, Request, Response } from 'express';
 import axios from 'axios';
 import https from 'https';
-import { malToAnilist, getSiteIds, getSiteIdsByMal, searchAnilist, SiteIds } from './utils/mapper';
+import crypto from 'crypto';
+import { malToAnilist, getSiteIds, getSiteIdsByMal, searchAnilist, invalidateSiteIds, SiteIds } from './utils/mapper';
 import { cacheStats } from './utils/cache';
 import { resolveEmbed } from './resolvers/megacloud';
 
@@ -124,6 +125,22 @@ async function fetchEpisodes(source: Source, siteIds: any, overrides: { heavenId
   }
   return { episodes: [], siteId: '', error: 'Unknown source' };
 }
+
+// DELETE /api/cache/siteids/:anilistId - drop the cached site-id mapping for one anime.
+// Disabled (404) unless ADMIN_TOKEN is set in the environment; otherwise requires it in
+// the x-admin-token header.
+router.delete('/cache/siteids/:anilistId', async (req: Request, res: Response) => {
+  const token = process.env.ADMIN_TOKEN || '';
+  if (!token) return res.status(404).json({ error: 'Not found' });
+  const provided = Buffer.from(String(req.headers['x-admin-token'] || ''));
+  const expected = Buffer.from(token);
+  if (provided.length !== expected.length || !crypto.timingSafeEqual(provided, expected)) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  const id = parseInt(req.params.anilistId, 10);
+  if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'anilistId must be a positive integer' });
+  return res.json({ anilistId: id, removed: await invalidateSiteIds(id) });
+});
 
 router.get('/search', async (req: Request, res: Response) => {
   const q = req.query.q as string;
