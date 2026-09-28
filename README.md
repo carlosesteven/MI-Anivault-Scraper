@@ -221,14 +221,18 @@ variable is set (see `env.example`):
 | Variable | Effect |
 |---|---|
 | `SITEIDS_REDIS_URL` | L1: shared Redis. Instances pointing at the same Redis share resolutions. `SITEIDS_REDIS_TTL` (seconds, default 7 days) |
-| `SITEIDS_DB_PATH` | L2: permanent SQLite file. Survives restarts and Redis flushes |
+| `SITEIDS_DATABASE_URL` | L2: permanent copy in Postgres, shared by every instance that can reach it. Uses its own table `anivault_siteids` (created from `migrations/0001_anivault_siteids.sql`); no other table is read or altered. Survives restarts and Redis flushes |
 | `SITEIDS_NEGATIVE_TTL` | Seconds before a provider that was searched and not found is searched again (default 1800) |
 | `ANILIST_META_BASE_URL` | Resolve title/malId through your own metadata service (`<base>/<anilistId>` → `{ id, title: { romaji, english }, malId }`) instead of calling AniList directly; falls back to AniList on any failure. `ANILIST_META_TIMEOUT_MS` (default 5000) |
 | `ANIFY_MAPPINGS_URL` | Legacy zoro/gogoanime mapping source. Off when empty (no route uses those ids) |
 | `ADMIN_TOKEN` | Enables `DELETE /api/cache/siteids/:anilistId` (send it as `x-admin-token`). Disabled while empty |
 
-Lookup order: memory → Redis → SQLite → full resolution. A record whose title could not
-be resolved is never stored, so a transient AniList outage cannot pin a wrong result.
+Lookup order: memory → Redis → Postgres → full resolution. A record whose title could not
+be resolved is never stored (the table also rejects it with a `CHECK`), so a transient
+AniList outage cannot pin a wrong result. Writes to Postgres merge: an id that is already
+known is never lost when another instance writes a stale view of the same anime. If
+Postgres becomes unreachable the level is skipped for 30 s at a time and requests keep
+working.
 Concurrent requests for the same anime share a single resolution. Because entries are
 permanent, a wrong match stays until you drop it with the `DELETE` endpoint above.
 
@@ -238,7 +242,7 @@ permanent, a wrong match stays until you drop it with the `DELETE` endpoint abov
 |---|---|
 | Runtime | Node.js (Express), TypeScript |
 | Scraping | Cheerio, Axios |
-| Caching | node-cache (in-memory), optional shared Redis + SQLite (see above) |
+| Caching | node-cache (in-memory), optional shared Redis + Postgres (see above) |
 | Hosting | Railway |
 
 ## Status
